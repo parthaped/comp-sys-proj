@@ -1,6 +1,8 @@
 #ifndef TREE_PROC_H
 #define TREE_PROC_H
 
+#include <stdio.h>
+
 #include "common.h"
 
 typedef struct {
