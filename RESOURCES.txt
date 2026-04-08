@@ -1,0 +1,21 @@
+ECE 434 Sp26 Project 1 Part 1 — links from assignment PDF
+=========================================================
+
+C / argv tutorials
+  https://www.tutorialspoint.com/cprogramming/c_command_line_arguments.htm
+  https://www.cprogramming.com/tutorial/c-tutorial.html
+
+GNU C Library manuals
+  https://www.gnu.org/software/libc/manual/html_node/Pipes-and-FIFOs.html
+  https://www.gnu.org/software/libc/manual/html_node/Creating-a-Process.html
+  https://www.gnu.org/software/libc/manual/html_node/Process-Completion.html
+
+Background
+  https://en.wikipedia.org/wiki/Depth-first_search
+
+Textbook
+  The C Programming Language — Kernighan & Ritchie
+
+poll() / pstree
+  man 2 poll
+  man 1 pstree

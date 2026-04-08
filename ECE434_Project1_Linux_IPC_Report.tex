@@ -1,0 +1,1025 @@
+% =============================================================================
+% ECE 434 Sp26 — Single-file LaTeX report (upload to Overleaf as one .tex)
+% Compiler: pdfLaTeX (Menu: Overleaf default). No shell-escape or minted required.
+% To regenerate from repo sources:  python3 gen_latex_report.py
+% =============================================================================
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{booktabs}
+\usepackage[hidelinks]{hyperref}
+\usepackage{nameref}
+
+\definecolor{codebg}{RGB}{248,248,255}
+\definecolor{codeframe}{RGB}{120,120,120}
+\definecolor{keywords}{RGB}{0,0,139}
+\definecolor{comments}{RGB}{106,115,125}
+
+\lstdefinestyle{textbookc}{
+  language=C,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{keywords}\bfseries,
+  commentstyle=\color{comments}\itshape,
+  stringstyle=\color{teal},
+  numberstyle=\tiny\sffamily\color{gray},
+  numbers=left,
+  stepnumber=1,
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{codeframe},
+  backgroundcolor=\color{codebg},
+  breaklines=true,
+  breakatwhitespace=false,
+  showstringspaces=false,
+  tabsize=4,
+  keepspaces=true,
+  columns=fullflexible,
+  aboveskip=\smallskipamount,
+  belowskip=\smallskipamount,
+  captionpos=b,
+}
+\lstdefinestyle{textbookmake}{
+  language=make,
+  basicstyle=\ttfamily\footnotesize,
+  commentstyle=\color{comments}\itshape,
+  numberstyle=\tiny\sffamily\color{gray},
+  numbers=left,
+  stepnumber=1,
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{codeframe},
+  backgroundcolor=\color{codebg},
+  breaklines=true,
+  tabsize=4,
+  keepspaces=true,
+  columns=fullflexible,
+  aboveskip=\smallskipamount,
+  belowskip=\smallskipamount,
+  captionpos=b,
+}
+\lstset{style=textbookc}
+
+\title{\textbf{Project 1: LINUX OS, Processes and Inter Process Communication}\\
+\large Rutgers ECE 434 / 579 --- Spring 2026}
+\author{Course Project (Group Submission)}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\clearpage
+
+\section{Problem Overview}
+This project implements a multi-process solution on Linux that (1)~generates or loads a text file of at least $L \geq 12{,}000$ positive integers with 150 hidden keys (random integers in $[-100,-1]$) placed at unknown positions; (2)~partitions work across up to $PN \leq 50$ processes arranged in a tree with branching factor $B \in \{2,3,5\}$; (3)~uses \textbf{pipes} for IPC, with parents collecting child results using \textbf{poll()} to avoid fixed-order blocking; (4)~uses \textbf{waitpid()} and status macros to explain how each child terminated; (5)~records per-process timing and bytes transferred in a CSV trace; and (6)~invokes \texttt{pstree -p} at key points for validation.
+
+\section{Design Summary}
+The implementation loads the file into a heap array in the root and relies on copy-on-write semantics after \texttt{fork()} so children can read partitions without rereading the file. A \emph{plan} assigns each node a contiguous index range $[lo,hi)$, a unique exit argument, and subtree sizes so that exactly $PN$ processes participate. Leaves compute local max, sum/count (for average), and detect hidden keys. Internal nodes merge child \texttt{SegmentResult} structures after reading whichever pipe becomes ready first. Optional \texttt{poll} timeout triggers \texttt{SIGKILL} for defensive termination as suggested in the handout.
+
+\textbf{Trade-offs.} More processes increase potential parallelism but add fork/pipe/wait overhead and smaller per-process segments (worse cache locality). Taller/wider trees increase communication volume proportional to the number of internal nodes. Timings for $L \in \{12000, 100000, 1000000\}$ should be measured on Linux; fill Table~\ref{tab:timing} with your machine's results.
+
+\begin{table}[ht]
+  \centering
+  \caption{Wall-clock time (seconds) --- replace with measured values on your Linux host.}
+  \label{tab:timing}
+  \begin{tabular}{@{}lccc@{}}
+    \toprule
+    Configuration & $L=12{,}000$ & $L=100{,}000$ & $L=1{,}000{,}000$ \\
+    \midrule
+    $PN=1$ (baseline) & --- & --- & --- \\
+    $PN=8$, $B=2$ & --- & --- & --- \\
+    $PN=8$, $B=5$ & --- & --- & --- \\
+    $PN=32$, $B=2$ & --- & --- & --- \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+For the required graph, export the table columns to a spreadsheet or Python/MATLAB and plot time versus $PN$ or versus branching factor.
+
+\section{Build and Run (Linux)}
+\begin{lstlisting}[style=textbookmake, numbers=none, frame=shadowbox, caption={Typical commands}]
+make clean && make
+./ece434_proj1 12000 10 8 2 --generate --sleep 1 input.txt output.txt
+\end{lstlisting}
+Arguments: \texttt{L H PN BRANCH input output}; use \texttt{--generate [SEED]} to build the input file; \texttt{--sleep SEC} slows leaves for \texttt{pstree} observation. Output text is written to \texttt{output.txt}; trace rows append to \texttt{process_trace.csv}.
+
+\section{Source Listings}
+The following listings mirror the project source files line-for-line. Style follows common textbook conventions: left rule, numbered lines, monospace body.
+
+\subsection{\texttt{common.h}}
+
+\lstset{style=textbookc}\begin{lstlisting}[caption={File \texttt{common.h}},label=lst:common_h]
+
+/*
+ * ECE 434 Sp26 — Project 1 Part 1 — shared definitions
+ * Resources (per assignment):
+ *   https://www.tutorialspoint.com/cprogramming/c_command_line_arguments.htm
+ *   https://www.cprogramming.com/tutorial/c-tutorial.html
+ *   https://www.gnu.org/software/libc/manual/html_node/Pipes-and-FIFOs.html
+ *   https://www.gnu.org/software/libc/manual/html_node/Creating-a-Process.html
+ *   https://www.gnu.org/software/libc/manual/html_node/Process-Completion.html
+ */
+#ifndef COMMON_H
+#define COMMON_H
+
+#include <limits.h>
+#include <stddef.h>
+#include <time.h>
+
+#define PROGRAM_TAG "ECE 434 Sp26"
+#define MAX_PN 50
+#define HIDDEN_KEY_COUNT 150
+#define HIDDEN_MIN (-100)
+#define HIDDEN_MAX (-1)
+
+#define TRACE_CSV "process_trace.csv"
+#define POLL_TIMEOUT_MS 30000
+#define MAX_BRANCHING 5
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+typedef struct {
+	long long sum;
+	int max;
+	int count;
+	int hidden_found;
+	/* global indices in original array where hidden keys (-1..-100) were seen */
+	int hidden_pos[256];
+	int hidden_pos_n;
+} SegmentResult;
+
+typedef struct {
+	int start;
+	int end;
+} Range;
+
+typedef struct {
+	struct timespec t0;
+	struct timespec t1;
+	unsigned long bytes_via_pipe;
+	size_t elems;
+} ProcStats;
+
+#endif
+
+\end{lstlisting}\clearpage
+
+\subsection{\texttt{data_gen.h}}
+
+\lstset{style=textbookc}\begin{lstlisting}[caption={File \texttt{data\_gen.h}},label=lst:data_gen_h]
+
+#ifndef DATA_GEN_H
+#define DATA_GEN_H
+
+#include "common.h"
+
+/* Create text file with L positive integers and 150 hidden negatives [-100,-1] at random positions. */
+int generate_input_file(const char *path, int L, unsigned seed);
+
+/* Load integers from whitespace-separated text file into malloc'd array; *out_n set to count. */
+int *load_file_to_array(const char *path, int *out_n);
+
+#endif
+
+\end{lstlisting}\clearpage
+
+\subsection{\texttt{data_gen.c}}
+
+\lstset{style=textbookc}\begin{lstlisting}[caption={File \texttt{data\_gen.c}},label=lst:data_gen_c]
+
+#include "data_gen.h"
+
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+int generate_input_file(const char *path, int L, unsigned seed) {
+	if (L < 12000) {
+		fprintf(stderr, "L must be >= 12000 per assignment.\n");
+		return -1;
+	}
+	if (L + HIDDEN_KEY_COUNT > INT_MAX / 2) {
+		fprintf(stderr, "L too large.\n");
+		return -1;
+	}
+	int total = L + HIDDEN_KEY_COUNT;
+	int *buf = (int *)calloc((size_t)total, sizeof(int));
+	if (!buf)
+		return -1;
+
+	srand(seed);
+	for (int i = 0; i < L; i++)
+		buf[i] = 1 + (rand() % 1000000);
+
+	/* Pick L distinct slot indices among total positions for positives; rest get keys */
+	int *slots = (int *)malloc((size_t)total * sizeof(int));
+	if (!slots) {
+		free(buf);
+		return -1;
+	}
+	for (int i = 0; i < total; i++)
+		slots[i] = i;
+	for (int i = total - 1; i > 0; i--) {
+		int j = rand() % (i + 1);
+		int t = slots[i];
+		slots[i] = slots[j];
+		slots[j] = t;
+	}
+	/* First L slots in shuffled order hold positives (already in buf[0..L-1] order wrong) */
+	int *out = (int *)calloc((size_t)total, sizeof(int));
+	if (!out) {
+		free(slots);
+		free(buf);
+		return -1;
+	}
+	for (int i = 0; i < L; i++)
+		out[slots[i]] = buf[i];
+	for (int i = L; i < total; i++) {
+		int v = HIDDEN_MIN + (rand() % (HIDDEN_MAX - HIDDEN_MIN + 1));
+		out[slots[i]] = v;
+	}
+
+	FILE *fp = fopen(path, "w");
+	if (!fp) {
+		perror(path);
+		free(out);
+		free(slots);
+		free(buf);
+		return -1;
+	}
+	for (int i = 0; i < total; i++) {
+		if (fprintf(fp, "%d", out[i]) < 0) {
+			fclose(fp);
+			free(out);
+			free(slots);
+			free(buf);
+			return -1;
+		}
+		if (i + 1 < total)
+			fputc('\n', fp);
+	}
+	fclose(fp);
+	free(out);
+	free(slots);
+	free(buf);
+	return 0;
+}
+
+int *load_file_to_array(const char *path, int *out_n) {
+	FILE *fp = fopen(path, "r");
+	if (!fp) {
+		perror(path);
+		return NULL;
+	}
+	int cap = 8192;
+	int n = 0;
+	int *arr = (int *)malloc((size_t)cap * sizeof(int));
+	if (!arr) {
+		fclose(fp);
+		return NULL;
+	}
+	int v;
+	while (fscanf(fp, "%d", &v) == 1) {
+		if (n >= cap) {
+			cap *= 2;
+			int *na = (int *)realloc(arr, (size_t)cap * sizeof(int));
+			if (!na) {
+				free(arr);
+				fclose(fp);
+				return NULL;
+			}
+			arr = na;
+		}
+		arr[n++] = v;
+	}
+	fclose(fp);
+	*out_n = n;
+	return arr;
+}
+
+\end{lstlisting}\clearpage
+
+\subsection{\texttt{metrics.h}}
+
+\lstset{style=textbookc}\begin{lstlisting}[caption={File \texttt{metrics.h}},label=lst:metrics_h]
+
+#ifndef METRICS_H
+#define METRICS_H
+
+#include "common.h"
+
+/* Scan arr[lo, hi) for max, mean (integer avg rounded toward zero), hidden keys. */
+void compute_segment(const int *arr, int lo, int hi, int global_offset, SegmentResult *out);
+
+#endif
+
+\end{lstlisting}\clearpage
+
+\subsection{\texttt{metrics.c}}
+
+\lstset{style=textbookc}\begin{lstlisting}[caption={File \texttt{metrics.c}},label=lst:metrics_c]
+
+#include "metrics.h"
+
+#include <limits.h>
+#include <string.h>
+
+static int is_hidden_key(int v) {
+	return v >= HIDDEN_MIN && v <= HIDDEN_MAX;
+}
+
+void compute_segment(const int *arr, int lo, int hi, int global_offset, SegmentResult *out) {
+	memset(out, 0, sizeof(*out));
+	if (lo >= hi) {
+		out->max = INT_MIN;
+		return;
+	}
+	out->max = arr[lo];
+	out->sum = 0;
+	out->count = hi - lo;
+	for (int i = lo; i < hi; i++) {
+		int x = arr[i];
+		if (x > out->max)
+			out->max = x;
+		out->sum += x;
+		if (is_hidden_key(x)) {
+			if (out->hidden_pos_n < (int)(sizeof(out->hidden_pos) / sizeof(out->hidden_pos[0]))) {
+				out->hidden_pos[out->hidden_pos_n++] = global_offset + (i - lo);
+			}
+			out->hidden_found++;
+		}
+	}
+}
+
+\end{lstlisting}\clearpage
+
+\subsection{\texttt{wait_status.h}}
+
+\lstset{style=textbookc}\begin{lstlisting}[caption={File \texttt{wait\_status.h}},label=lst:wait_status_h]
+
+#ifndef WAIT_STATUS_H
+#define WAIT_STATUS_H
+
+#include <sys/types.h>
+
+/* Decode child status from waitpid(); print human-readable reason (GNU libc / Stevens style). */
+void explain_wait_status(pid_t pid, int status);
+
+#endif
+
+\end{lstlisting}\clearpage
+
+\subsection{\texttt{wait_status.c}}
+
+\lstset{style=textbookc}\begin{lstlisting}[caption={File \texttt{wait\_status.c}},label=lst:wait_status_c]
+
+#define _POSIX_C_SOURCE 200809L
+
+#include "wait_status.h"
+#include "common.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <sys/wait.h>
+
+void explain_wait_status(pid_t pid, int status) {
+	printf("%s: waitpid result for pid %ld: ", PROGRAM_TAG, (long)pid);
+	if (WIFEXITED(status)) {
+		printf("exited normally with status %d\n", WEXITSTATUS(status));
+	} else if (WIFSIGNALED(status)) {
+		const char *sig = strsignal(WTERMSIG(status));
+		printf("terminated by signal %d (%s)%s\n", WTERMSIG(status), sig ? sig : "?",
+		       WCOREDUMP(status) ? ", core dumped" : "");
+	} else if (WIFSTOPPED(status)) {
+		const char *sig = strsignal(WSTOPSIG(status));
+		printf("stopped by signal %d (%s)\n", WSTOPSIG(status), sig ? sig : "?");
+	} else if (WIFCONTINUED(status)) {
+		printf("continued\n");
+	} else {
+		printf("unknown status 0x%x\n", status);
+	}
+}
+
+\end{lstlisting}\clearpage
+
+\subsection{\texttt{trace.h}}
+
+\lstset{style=textbookc}\begin{lstlisting}[caption={File \texttt{trace.h}},label=lst:trace_h]
+
+#ifndef TRACE_H
+#define TRACE_H
+
+#include "common.h"
+
+#include <stdio.h>
+#include <time.h>
+
+void trace_init_file(const char *csv_path);
+void trace_write_row(const char *csv_path, int pid, int ppid, int return_arg,
+		     const struct timespec *t0, const struct timespec *t1,
+		     size_t elems_processed, unsigned long bytes_ipc);
+
+#endif
+
+\end{lstlisting}\clearpage
+
+\subsection{\texttt{trace.c}}
+
+\lstset{style=textbookc}\begin{lstlisting}[caption={File \texttt{trace.c}},label=lst:trace_c]
+
+#include "trace.h"
+
+#include <stdio.h>
+
+void trace_init_file(const char *csv_path) {
+	FILE *fp = fopen(csv_path, "w");
+	if (!fp) {
+		perror(csv_path);
+		return;
+	}
+	fprintf(fp, "pid,ppid,return_arg,runtime_s,elems,bytes_ipc\n");
+	fclose(fp);
+}
+
+void trace_write_row(const char *csv_path, int pid, int ppid, int return_arg,
+		     const struct timespec *t0, const struct timespec *t1,
+		     size_t elems_processed, unsigned long bytes_ipc) {
+	FILE *fp = fopen(csv_path, "a");
+	if (!fp) {
+		perror(csv_path);
+		return;
+	}
+	double runtime = (double)(t1->tv_sec - t0->tv_sec) +
+			 (double)(t1->tv_nsec - t0->tv_nsec) / 1e9;
+	fprintf(fp, "%d,%d,%d,%.6f,%zu,%lu\n", pid, ppid, return_arg, runtime,
+		elems_processed, bytes_ipc);
+	fclose(fp);
+}
+
+\end{lstlisting}\clearpage
+
+\subsection{\texttt{tree_proc.h}}
+
+\lstset{style=textbookc}\begin{lstlisting}[caption={File \texttt{tree\_proc.h}},label=lst:tree_proc_h]
+
+#ifndef TREE_PROC_H
+#define TREE_PROC_H
+
+#include "common.h"
+
+typedef struct {
+	int lo, hi;
+	int exit_code;
+	int subtree;
+	int child[MAX_BRANCHING];
+	int nchild;
+} PlanNode;
+
+/* Build a BFS-style partition plan: total processes = pn, branching factor 2..5. Returns plan count or -1. */
+int build_process_plan(int n_elems, int pn, int branching, PlanNode *plan, int cap);
+
+/*
+ * Execute plan from root index 0. arr is shared read-only via fork COW.
+ * parent_wr == -1 for root (does not exit on leaf/internal; returns in *final_out).
+ */
+void execute_plan_root(int *arr, int n, PlanNode *plan, int root_index, FILE *result_out,
+		       const char *trace_path, int leaf_sleep_sec, SegmentResult *final_out);
+
+#endif
+
+\end{lstlisting}\clearpage
+
+\subsection{\texttt{tree_proc.c}}
+
+\lstset{style=textbookc}\begin{lstlisting}[caption={File \texttt{tree\_proc.c}},label=lst:tree_proc_c]
+
+#define _POSIX_C_SOURCE 200809L
+
+#include "tree_proc.h"
+
+#include "metrics.h"
+#include "trace.h"
+#include "wait_status.h"
+
+#include <limits.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+static int build_rec(int lo, int hi, int subtree, int branching, PlanNode *plan, int cap, int *nplan,
+		     int *next_code) {
+	if (*nplan >= cap)
+		return -1;
+	int id = (*nplan)++;
+	plan[id].lo = lo;
+	plan[id].hi = hi;
+	plan[id].subtree = subtree;
+	plan[id].exit_code = (*next_code)++;
+	if (plan[id].exit_code > 255)
+		plan[id].exit_code = 2 + (id % 200);
+	plan[id].nchild = 0;
+	if (subtree <= 1 || hi - lo <= 1)
+		return id;
+	int below = subtree - 1;
+	int k = branching;
+	if (k > below)
+		k = below;
+	if (k < 1)
+		return id;
+	int sizes[MAX_BRANCHING];
+	int base = below / k;
+	int rem = below % k;
+	for (int i = 0; i < k; i++)
+		sizes[i] = base + (i < rem);
+	int len = hi - lo;
+	for (int i = 0; i < k; i++) {
+		int clo = lo + (i * len) / k;
+		int chi = lo + ((i + 1) * len) / k;
+		int cid = build_rec(clo, chi, sizes[i], branching, plan, cap, nplan, next_code);
+		if (cid < 0)
+			return -1;
+		plan[id].child[plan[id].nchild++] = cid;
+	}
+	return id;
+}
+
+int build_process_plan(int n_elems, int pn, int branching, PlanNode *plan, int cap) {
+	(void)n_elems;
+	if (branching < 2 || branching > 5 || pn < 1 || pn > MAX_PN)
+		return -1;
+	int nplan = 0;
+	int code = 1;
+	if (build_rec(0, n_elems, pn, branching, plan, cap, &nplan, &code) < 0)
+		return -1;
+	return nplan;
+}
+
+static void print_pstree_snapshot(pid_t me) {
+	char cmd[256];
+	snprintf(cmd, sizeof(cmd), "pstree -p %ld 2>/dev/null | head -40", (long)me);
+	printf("%s: --- pstree -p %ld ---\n", PROGRAM_TAG, (long)me);
+	fflush(stdout);
+	if (system(cmd) < 0)
+		perror("system/pstree");
+	fflush(stdout);
+}
+
+static void run_node(int *arr, int n, PlanNode *plan, int nid, int parent_wr,
+		     const char *trace_path, int leaf_sleep, SegmentResult *root_out) {
+	(void)n;
+	PlanNode *p = &plan[nid];
+	pid_t mypid = getpid();
+	pid_t ppid = getppid();
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	unsigned long bytes_ipc = 0;
+
+	printf("%s: I'm process %d with return arg %d and my parent is %d.\n", PROGRAM_TAG,
+	       (int)mypid, p->exit_code, (int)ppid);
+	fflush(stdout);
+	printf("%s: phase start pid %d range [%d,%d) subtree_nodes=%d\n", PROGRAM_TAG, (int)mypid,
+	       p->lo, p->hi, p->subtree);
+	fflush(stdout);
+
+	if (p->nchild == 0) {
+		SegmentResult res;
+		compute_segment(arr, p->lo, p->hi, p->lo, &res);
+		printf("%s: phase local compute done pid %d (leaf)\n", PROGRAM_TAG, (int)mypid);
+		fflush(stdout);
+		if (leaf_sleep > 0)
+			sleep((unsigned)leaf_sleep);
+		for (int i = 0; i < res.hidden_pos_n; i++) {
+			printf("%s: I am process %d with return arg %d. I found the hidden key in position A[%d].\n",
+			       PROGRAM_TAG, (int)mypid, p->exit_code, res.hidden_pos[i]);
+			fflush(stdout);
+		}
+		if (parent_wr >= 0) {
+			ssize_t w = write(parent_wr, &res, sizeof(res));
+			if (w != (ssize_t)sizeof(res))
+				perror("write leaf result");
+			bytes_ipc += (unsigned long)(w > 0 ? (unsigned long)w : 0U);
+		}
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		trace_write_row(trace_path, (int)mypid, (int)ppid, p->exit_code, &t0, &t1,
+				(size_t)(p->hi - p->lo), bytes_ipc);
+		if (parent_wr >= 0) {
+			printf("%s: phase exiting leaf pid %d exit %d\n", PROGRAM_TAG, (int)mypid,
+			       p->exit_code);
+			fflush(stdout);
+			exit(p->exit_code & 0xFF);
+		}
+		if (root_out)
+			*root_out = res;
+		return;
+	}
+
+	int k = p->nchild;
+	int pr[MAX_BRANCHING][2];
+	pid_t cpids[MAX_BRANCHING];
+
+	for (int i = 0; i < k; i++) {
+		if (pipe(pr[i]) < 0) {
+			perror("pipe");
+			if (parent_wr >= 0)
+				exit(1);
+			return;
+		}
+	}
+
+	printf("%s: phase fork %d children pid %d\n", PROGRAM_TAG, k, (int)mypid);
+	fflush(stdout);
+	print_pstree_snapshot(mypid);
+
+	for (int i = 0; i < k; i++) {
+		pid_t pid = fork();
+		if (pid < 0) {
+			perror("fork");
+			if (parent_wr >= 0)
+				exit(1);
+			return;
+		}
+		if (pid == 0) {
+			for (int j = 0; j < k; j++) {
+				close(pr[j][0]);
+				if (j != i)
+					close(pr[j][1]);
+			}
+			if (parent_wr >= 0)
+				close(parent_wr);
+			run_node(arr, n, plan, p->child[i], pr[i][1], trace_path, leaf_sleep, NULL);
+			_exit(1);
+		}
+		cpids[i] = pid;
+		close(pr[i][1]);
+	}
+
+	struct pollfd *pfds = (struct pollfd *)calloc((size_t)k, sizeof(struct pollfd));
+	int *done = (int *)calloc((size_t)k, sizeof(int));
+	SegmentResult *partial =
+		(SegmentResult *)calloc((size_t)k, sizeof(SegmentResult));
+	if (!pfds || !done || !partial) {
+		perror("calloc");
+		_exit(1);
+	}
+	for (int i = 0; i < k; i++) {
+		pfds[i].fd = pr[i][0];
+		pfds[i].events = POLLIN;
+	}
+	int remaining = k;
+	while (remaining > 0) {
+		int r = poll(pfds, (nfds_t)k, POLL_TIMEOUT_MS);
+		if (r < 0) {
+			perror("poll");
+			break;
+		}
+		if (r == 0) {
+			printf("%s: poll timed out (%d ms); sending SIGKILL to unfinished children\n",
+			       PROGRAM_TAG, POLL_TIMEOUT_MS);
+			fflush(stdout);
+			for (int i = 0; i < k; i++) {
+				if (!done[i])
+					kill(cpids[i], SIGKILL);
+			}
+			break;
+		}
+		for (int i = 0; i < k; i++) {
+			if (done[i])
+				continue;
+			short rev = pfds[i].revents;
+			if (rev & POLLIN) {
+				ssize_t nb = read(pr[i][0], &partial[i], sizeof(SegmentResult));
+				if (nb == (ssize_t)sizeof(SegmentResult)) {
+					done[i] = 1;
+					remaining--;
+					bytes_ipc += (unsigned long)nb;
+				}
+			} else if (rev & (POLLERR | POLLHUP | POLLNVAL)) {
+				/* try drain once */
+				ssize_t nb = read(pr[i][0], &partial[i], sizeof(SegmentResult));
+				if (nb == (ssize_t)sizeof(SegmentResult)) {
+					done[i] = 1;
+					remaining--;
+					bytes_ipc += (unsigned long)nb;
+				}
+			}
+		}
+	}
+
+	for (int i = 0; i < k; i++)
+		close(pr[i][0]);
+
+	SegmentResult merged;
+	memset(&merged, 0, sizeof(merged));
+	merged.max = INT_MIN;
+	long long sum = 0;
+	int count = 0;
+	for (int i = 0; i < k; i++) {
+		if (!done[i])
+			continue;
+		if (partial[i].max > merged.max)
+			merged.max = partial[i].max;
+		sum += partial[i].sum;
+		count += partial[i].count;
+		merged.hidden_found += partial[i].hidden_found;
+		for (int j = 0; j < partial[i].hidden_pos_n; j++) {
+			if (merged.hidden_pos_n < (int)(sizeof(merged.hidden_pos) / sizeof(merged.hidden_pos[0])))
+				merged.hidden_pos[merged.hidden_pos_n++] = partial[i].hidden_pos[j];
+		}
+	}
+	merged.sum = sum;
+	merged.count = count;
+
+	printf("%s: phase waitpid all direct children pid %d\n", PROGRAM_TAG, (int)mypid);
+	fflush(stdout);
+	for (int i = 0; i < k; i++) {
+		int st = 0;
+		pid_t w = waitpid(cpids[i], &st, 0);
+		if (w > 0)
+			explain_wait_status(w, st);
+		fflush(stdout);
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	trace_write_row(trace_path, (int)mypid, (int)ppid, p->exit_code, &t0, &t1,
+			(size_t)(p->hi - p->lo), bytes_ipc);
+
+	if (parent_wr >= 0) {
+		ssize_t w = write(parent_wr, &merged, sizeof(merged));
+		if (w != (ssize_t)sizeof(merged))
+			perror("write internal result");
+		free(pfds);
+		free(done);
+		free(partial);
+		printf("%s: phase exiting internal pid %d exit %d\n", PROGRAM_TAG, (int)mypid,
+		       p->exit_code);
+		fflush(stdout);
+		exit(p->exit_code & 0xFF);
+	}
+
+	if (root_out)
+		*root_out = merged;
+
+	free(pfds);
+	free(done);
+	free(partial);
+}
+
+void execute_plan_root(int *arr, int n, PlanNode *plan, int root_index, FILE *result_out,
+		       const char *trace_path, int leaf_sleep_sec, SegmentResult *final_out) {
+	struct timespec troot0, troot1;
+	clock_gettime(CLOCK_MONOTONIC, &troot0);
+	run_node(arr, n, plan, root_index, -1, trace_path, leaf_sleep_sec, final_out);
+	clock_gettime(CLOCK_MONOTONIC, &troot1);
+
+	if (!final_out)
+		return;
+	int avg = final_out->count ? (int)(final_out->sum / final_out->count) : 0;
+	printf("Max=%d, Avg=%d\n", final_out->max, avg);
+	fflush(stdout);
+	if (result_out) {
+		fprintf(result_out, "Max=%d, Avg=%d\n", final_out->max, avg);
+		fflush(result_out);
+	}
+	double tr = (double)(troot1.tv_sec - troot0.tv_sec) +
+		    (double)(troot1.tv_nsec - troot0.tv_nsec) / 1e9;
+	printf("%s: root total runtime %.6f s\n", PROGRAM_TAG, tr);
+	fflush(stdout);
+}
+
+\end{lstlisting}\clearpage
+
+\subsection{\texttt{main.c}}
+
+\lstset{style=textbookc}\begin{lstlisting}[caption={File \texttt{main.c}},label=lst:main_c]
+
+/*
+ * ECE 434 Sp26 — Project 1 Part 1 (Linux: processes, pipes, poll, waitpid)
+ *
+ * CLI:  ./ece434_proj1 L H PN BRANCH_IN_2_5 [--generate [SEED]] [--sleep SEC] INPUT.txt OUTPUT.txt
+ * Docs: https://www.tutorialspoint.com/cprogramming/c_command_line_arguments.htm
+ *       https://www.gnu.org/software/libc/manual/html_node/Pipes-and-FIFOs.html
+ *       https://www.gnu.org/software/libc/manual/html_node/Creating-a-Process.html
+ *       https://www.gnu.org/software/libc/manual/html_node/Process-Completion.html
+ */
+#define _POSIX_C_SOURCE 200809L
+
+#include "common.h"
+#include "data_gen.h"
+#include "trace.h"
+#include "tree_proc.h"
+
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+static void usage(const char *argv0) {
+	fprintf(stderr,
+		"Usage: %s L H PN BRANCH INPUT OUTPUT\n"
+		"       L>=12000, H=how many hidden keys to hunt (info), PN process count 1..50, BRANCH in {2,3,5}\n"
+		"Options before INPUT/OUTPUT:\n"
+		"  --generate [SEED]   build INPUT with L positives + 150 hidden keys\n"
+		"  --sleep SEC         leaf sleep for observing pstree (default 0)\n",
+		argv0);
+}
+
+static int parse_int(const char *s, int *out) {
+	char *end = NULL;
+	long v = strtol(s, &end, 10);
+	if (!end || *end || v < INT_MIN || v > INT_MAX)
+		return -1;
+	*out = (int)v;
+	return 0;
+}
+
+int main(int argc, char **argv) {
+	int L = 12000;
+	int H = 10;
+	int PN = 4;
+	int branch = 2;
+	int gen = 0;
+	unsigned seed = 0;
+	int leaf_sleep = 0;
+	const char *in_path = "input.txt";
+	const char *out_path = "output.txt";
+
+	if (argc >= 6) {
+		int ai = 1;
+		if (parse_int(argv[ai++], &L) || L < 12000)
+			return (usage(argv[0]), 1);
+		if (parse_int(argv[ai++], &H) || H < 0)
+			return (usage(argv[0]), 1);
+		if (parse_int(argv[ai++], &PN) || PN < 1 || PN > MAX_PN)
+			return (usage(argv[0]), 1);
+		if (parse_int(argv[ai++], &branch) || (branch != 2 && branch != 3 && branch != 5))
+			return (usage(argv[0]), 1);
+		while (ai < argc - 2) {
+			if (strcmp(argv[ai], "--generate") == 0) {
+				gen = 1;
+				ai++;
+				if (ai < argc - 2 && argv[ai][0] != '-') {
+					unsigned long sv = strtoul(argv[ai], NULL, 10);
+					seed = (unsigned)sv;
+					ai++;
+				} else {
+					seed = (unsigned)time(NULL);
+				}
+			} else if (strcmp(argv[ai], "--sleep") == 0 && ai + 1 < argc - 2) {
+				if (parse_int(argv[ai + 1], &leaf_sleep) || leaf_sleep < 0)
+					return (usage(argv[0]), 1);
+				ai += 2;
+			} else {
+				fprintf(stderr, "Unknown option: %s\n", argv[ai]);
+				return (usage(argv[0]), 1);
+			}
+		}
+		in_path = argv[argc - 2];
+		out_path = argv[argc - 1];
+	} else if (argc == 1) {
+		static char inbuf[4096];
+		static char outbuf[4096];
+		printf("Enter L (>=12000), H, PN (1-%d), branch (2,3,5): ", MAX_PN);
+		if (scanf("%d%d%d%d", &L, &H, &PN, &branch) != 4)
+			return 1;
+		printf("Input file path: ");
+		if (scanf("%4095s", inbuf) != 1)
+			return 1;
+		in_path = inbuf;
+		printf("Output file path: ");
+		if (scanf("%4095s", outbuf) != 1)
+			return 1;
+		out_path = outbuf;
+		if (L < 12000 || PN < 1 || PN > MAX_PN || (branch != 2 && branch != 3 && branch != 5))
+			return (usage(argv[0]), 1);
+	} else {
+		usage(argv[0]);
+		return 1;
+	}
+
+	if (!seed)
+		seed = (unsigned)time(NULL);
+	if (gen) {
+		if (generate_input_file(in_path, L, seed) != 0)
+			return 1;
+	}
+
+	int n = 0;
+	int *arr = load_file_to_array(in_path, &n);
+	if (!arr || n <= 0)
+		return 1;
+
+	PlanNode plan[MAX_PN];
+	int pn = build_process_plan(n, PN, branch, plan, MAX_PN);
+	if (pn < 0) {
+		fprintf(stderr, "Failed to build process plan.\n");
+		free(arr);
+		return 1;
+	}
+
+	unlink(TRACE_CSV);
+	trace_init_file(TRACE_CSV);
+
+	FILE *fout = fopen(out_path, "w");
+	if (!fout) {
+		perror(out_path);
+		free(arr);
+		return 1;
+	}
+
+	SegmentResult final;
+	memset(&final, 0, sizeof(final));
+	printf("%s: root loading %d integers; plan uses %d tree nodes, branch=%d, PN=%d, H=%d\n",
+	       PROGRAM_TAG, n, pn, branch, PN, H);
+	fflush(stdout);
+
+	execute_plan_root(arr, n, plan, 0, fout, TRACE_CSV, leaf_sleep, &final);
+
+	fprintf(fout, "Hidden keys encountered in scan: %d (file contains %d; hunt parameter H=%d)\n",
+		final.hidden_found, HIDDEN_KEY_COUNT, H);
+	printf("%s: Hidden keys encountered in scan: %d (file contains %d; hunt parameter H=%d)\n",
+	       PROGRAM_TAG, final.hidden_found, HIDDEN_KEY_COUNT, H);
+	fflush(stdout);
+
+	fclose(fout);
+	free(arr);
+	return 0;
+}
+
+\end{lstlisting}\clearpage
+
+\subsection{\texttt{Makefile}}
+
+\lstset{style=textbookmake}\begin{lstlisting}[caption={File \texttt{Makefile}},label=lst:Makefile]
+
+# ECE 434 Sp26 Project 1 — build on Linux (GCC).
+# Example: make && ./ece434_proj1 12000 10 8 2 --generate --sleep 1 input.txt out.txt
+# Reference: https://www.gnu.org/software/make/manual/make.html
+
+CC = gcc
+CFLAGS = -Wall -Wextra -O2 -std=c11 -D_GNU_SOURCE
+LDFLAGS =
+
+OBJS = main.o data_gen.o metrics.o wait_status.o trace.o tree_proc.o
+
+all: ece434_proj1
+
+ece434_proj1: $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
+
+main.o: main.c common.h data_gen.h trace.h tree_proc.h
+data_gen.o: data_gen.c data_gen.h common.h
+metrics.o: metrics.c metrics.h common.h
+wait_status.o: wait_status.c wait_status.h common.h
+trace.o: trace.c trace.h common.h
+tree_proc.o: tree_proc.c tree_proc.h common.h metrics.h trace.h wait_status.h
+
+clean:
+	rm -f $(OBJS) ece434_proj1 process_trace.csv
+
+.PHONY: all clean
+
+\end{lstlisting}\clearpage
+
+\section{Answers to Additional Questions (Handout)}
+
+\paragraph{(1) Root killed with \texttt{kill -KILL <pid>}.}
+Signal \texttt{SIGKILL} cannot be caught or ignored. The root terminates immediately without flushing stdio buffers or cleaning up children explicitly. Child processes become orphaned and are reparented to \texttt{init} (or a subreaper such as \texttt{systemd}), which will eventually reap them when they exit. Pipes may lack a reader/writer if the kill order leaves an endpoint open; peers may see \texttt{SIGPIPE} or \texttt{EPIPE} on write, or \texttt{read} returning 0. No graceful merge of partial results occurs.
+
+\paragraph{(2) \texttt{pstree} with root \texttt{getpid()} vs using the wrong PID.}
+\texttt{pstree -p <pid>} shows the subtree rooted at the process with that PID. If you pass your shell's PID by mistake, you see the shell's descendants (often unrelated to your program). If you pass a child's PID, you see only that child's subtree, not siblings or ancestors. Always pass the intended process's PID (typically the project root after \texttt{fork} waves begin, often the same as the original \texttt{main} PID unless the program double-forks or daemonizes).
+
+\paragraph{(3) Maximum \emph{random tree} and why.}
+The assignment caps $PN \leq 50$. The implementation also uses \texttt{PlanNode plan[MAX\_PN]} with \texttt{MAX\_PN = 50}. Beyond that, process limits (\texttt{/proc/sys/kernel/pid\_max}, \texttt{ulimit -u}), memory for pipe buffers and stacks, and the operating system's ability to schedule many runnable tasks bound practical depth/breadth. Exit statuses are only 8~bits; the code assigns distinct logical exit arguments per node and masks with \texttt{\& 0xFF} when calling \texttt{exit()}---for $\leq 50$ processes this stays within distinct low-byte values by construction, but for very large trees you would need a different reporting channel than the exit status alone.
+
+\section{References and Course Links}
+\begin{itemize}
+  \item \url{https://www.tutorialspoint.com/cprogramming/c_command_line_arguments.htm}
+  \item \url{https://www.cprogramming.com/tutorial/c-tutorial.html}
+  \item \url{https://www.gnu.org/software/libc/manual/html_node/Pipes-and-FIFOs.html}
+  \item \url{https://www.gnu.org/software/libc/manual/html_node/Creating-a-Process.html}
+  \item \url{https://www.gnu.org/software/libc/manual/html_node/Process-Completion.html}
+  \item \url{https://en.wikipedia.org/wiki/Depth-first_search}
+  \item \texttt{man 2 pipe}, \texttt{man 2 poll}, \texttt{man 2 waitpid}, \texttt{man 1 pstree}
+\end{itemize}
+
+\end{document}
